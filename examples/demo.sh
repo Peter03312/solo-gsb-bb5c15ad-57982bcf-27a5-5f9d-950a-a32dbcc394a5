@@ -81,18 +81,39 @@ say "13) 试算 2026 年 2 月期间（80 分：50/24/6）"
 $C "$BASE/statements/preview?start=2026-02-01T00:00:00%2B08:00&end=2026-03-01T00:00:00%2B08:00" | python3 -m json.tool; echo
 
 say "14) 出具初次单（50/24/6，无待处理，因为协议已后补）"
-$C -X POST "$BASE/statements/issue" -H 'Content-Type: application/json' \
-  -d '{"start":"2026-02-01T00:00:00+08:00","end":"2026-03-01T00:00:00+08:00"}' | python3 -m json.tool; echo
+INIT=$($C -X POST "$BASE/statements/issue" -H 'Content-Type: application/json' \
+  -d '{"start":"2026-02-01T00:00:00+08:00","end":"2026-03-01T00:00:00+08:00"}')
+echo "$INIT" | python3 -m json.tool
+INIT_ID=$(echo "$INIT" | python3 -c 'import sys,json;print(json.load(sys.stdin)["batch_id"])')
+
+say "14a) 初次单逐笔归因：按更正链原始编号 PLAY-1001 归集，含链尾/作品/时间/协议/比例/逐笔分摊"
+$C "$BASE/statements/$INIT_ID/attributions?page=1&page_size=20" | python3 -m json.tool
+
+say "14b) 只看权利人 RS-A 的归因；attributed_total 与原明细行金额一致(reconciles)"
+$C "$BASE/statements/$INIT_ID/attributions?holder_code=RS-A" | python3 -m json.tool
 
 say "15) 再次更正（80 -> 30），再出具 => 差额追补单（可正可负）"
 $C -X POST "$BASE/plays/import" -H 'Content-Type: application/json' \
-  -d '{"import_id":"PLAY-1001-R2","work_code":"W-LIVE-001","occurred_at":"2026-02-10T20:00:00+08:00","amount":30,"corrects_id":"PLAY-1001-R1"}'; echo
-$C -X POST "$BASE/statements/issue" -H 'Content-Type: application/json' \
-  -d '{"start":"2026-02-01T00:00:00+08:00","end":"2026-03-01T00:00:00+08:00"}' | python3 -m json.tool; echo
+  -d '{"import_id":"PLAY-1001-R2","work_code":"W-LIVE-001","occurred_at":"2026-02-10T20:00:00+08:00","amount":30,"corrects_id":"PLAY-1001-R1"}' >/dev/null
+SUP=$($C -X POST "$BASE/statements/issue" -H 'Content-Type: application/json' \
+  -d '{"start":"2026-02-01T00:00:00+08:00","end":"2026-03-01T00:00:00+08:00"}')
+echo "$SUP" | python3 -m json.tool
+SUP_ID=$(echo "$SUP" | python3 -c 'import sys,json;print(json.load(sys.stdin)["batch_id"])')
 
-say "16) 数据无变化再出具 => 不产生新单据"
+say "15a) 追补单逐笔归因：removed(撤销旧链尾 80 的分摊，负数保留) 与 added(新链尾 30 的分摊) 分列"
+$C "$BASE/statements/$SUP_ID/attributions" | python3 -m json.tool
+
+say "15b) 历史不被日后数据改写：初次单归因仍指向旧链尾 PLAY-1001-R1(80)"
+$C "$BASE/statements/$INIT_ID/attributions?holder_code=RS-A" | python3 -m json.tool
+
+say "15c) 错误用法：不存在的单据 404；页码非法 422；权利人不存在 404"
+$C -i "$BASE/statements/999999/attributions" | head -1
+$C -i "$BASE/statements/$INIT_ID/attributions?page=0" | head -1
+$C -i "$BASE/statements/$INIT_ID/attributions?holder_code=NOBODY" | head -1
+
+say "16) 数据无变化再出具 => 不产生新单据（也不重复生成归因）"
 $C -X POST "$BASE/statements/issue" -H 'Content-Type: application/json' \
-  -d '{"start":"2026-02-01T00:00:00+08:00","end":"2026-03-01T00:00:00+08:00"}' | python3 -m json.tool; echo
+  -d '{"start":"2026-02-01T00:00:00+08:00","end":"2026-03-01T00:00:00+08:00"}' | python3 -m json.tool
 
 say "17) 列出该期间全部单据（1 张初次 + 1 张追补）"
 $C "$BASE/statements?start=2026-02-01T00:00:00%2B08:00&end=2026-03-01T00:00:00%2B08:00" | python3 -m json.tool; echo

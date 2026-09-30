@@ -185,6 +185,8 @@ class StatementOut(BaseModel):
     period_end: datetime
     issued_at: datetime
     note: str | None = None
+    # 是否具备逐笔归因证据；升级前的存量单据为 false（不可追溯）
+    traceable: bool = True
     payable: list[StatementLineOut]
     pending: list[PendingItem]
 
@@ -194,5 +196,48 @@ class StatementSummary(BaseModel):
     kind: str
     supersedes_batch_id: int | None
     created_at: datetime
+    traceable: bool = True
     lines: list[StatementLineOut]
     pending: list[PendingItem]
+
+
+# ---- 逐笔归因证据 ----
+
+class AttributionRecord(BaseModel):
+    """单条逐笔归因：某权利人在某更正链（按原始编号归集）上的分摊。"""
+    holder_code: str
+    change_type: str  # added | removed | legacy
+    # 更正链原始编号；legacy（旧账差额）行为 None
+    root_import_id: str | None = None
+    # 出具时冻结的链尾与核算上下文；legacy 行为 None
+    tail_import_id: str | None = None
+    work_code: str | None = None
+    occurred_at: datetime | None = None
+    agreement_id: int | None = None
+    tail_amount: int | None = None
+    share_percent: str | None = None
+    # 该笔分摊对本单据的贡献：added 非负、removed 为负（撤销）、legacy 为旧账差额
+    amount: int
+
+
+class AttributionHolderTotal(BaseModel):
+    holder_code: str
+    # 该权利人在本单据全部归因记录的金额合计（含撤销负额、旧账差额）
+    attributed_total: int
+    # 该权利人在原单据明细行上的金额（初次单为应付，追补单为差额）
+    statement_line_amount: int
+    # 两者是否一致；不可追溯的存量单据恒为 false（无逐笔证据可核对）
+    reconciles: bool
+
+
+class AttributionPage(BaseModel):
+    batch_id: int
+    traceable: bool
+    holder_code: str | None = None
+    page: int
+    page_size: int
+    total_records: int
+    # 各权利人合计（受 holder_code 过滤）；不可追溯单据为空列表
+    holder_totals: list[AttributionHolderTotal]
+    # 当前页归因记录
+    records: list[AttributionRecord]

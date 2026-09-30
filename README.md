@@ -15,6 +15,17 @@ Python + FastAPI + PostgreSQL 实现的播放版税结算服务，支持：
   - 已出具单据 **不可覆盖**；
   - 后补协议或播放更正后，再出具按 **新应付额 − 此前单据累计额** 出具 **追补单**，差额 **可正可负**；
   - 应付无变化不产生新单据；同一期间并发出具经咨询锁串行化，**不会产生重复单据**。
+- **逐笔归因证据（财务核对）**：每次出具同步冻结"每位权利人的每笔金额来自哪些播放"：
+  - 按 **更正链原始编号** 归集，固化参与核算的 **链尾编号、作品、发生时间、匹配协议、比例与逐笔分摊**；
+  - 追补单逐笔记录相对上次出具的差额：`added`（新增）/ `removed`（撤销，**负额逐笔保留不轧差**），
+    跨期更正、协议后补造成的撤销与新增均可分辨；
+  - 归因记录 **一经冻结不可修改/删除**（触发器强制），历史单据不随日后播放或协议变化；
+    待处理播放不计入应付、不产生证据；
+  - 按 **单据 + 权利人分页** 查询归因记录与逐权利人合计，
+    合计 **恒等于该单据原有明细行**（`reconciles=true`）；
+  - 升级前已存在、无逐笔证据的存量单据自动标记 **不可追溯**（`traceable=false`）；
+    其追补中无法归因的旧账差额单列为 `legacy`（无播放字段），**绝不用当前播放冒充历史**；
+  - 并发出具不会重复生成证据；应付无变化不生成新单据，也不生成归因。
 
 ## 一键启动
 
@@ -105,11 +116,31 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| POST | `/statements/issue` | 按期间出具；首次初次单，其后差额追补单（无变化不出新单） |
+| POST | `/statements/issue` | 按期间出具；首次初次单，其后差额追补单（无变化不出新单）；同步冻结逐笔归因 |
 | GET | `/statements/preview?start=&end=` | 不出具，试算当前应付、待处理、潜在差额 |
-| GET | `/statements?start=&end=` | 列出该期间全部单据及明细 |
+| GET | `/statements?start=&end=` | 列出该期间全部单据及明细（含 `traceable` 可追溯标记） |
+| GET | `/statements/{batch_id}/attributions` | 按单据分页查询逐笔归因记录与逐权利人合计（可按 `holder_code` 过滤） |
 
 期间同样是半开区间 `[start, end)`，与协议区间语义一致。
+
+#### 逐笔归因查询参数
+
+| 参数 | 位置 | 说明 |
+| --- | --- | --- |
+| `batch_id` | 路径 | 单据编号；不存在返回 `404 statement_not_found` |
+| `holder_code` | query | 可选，只看某位权利人；权利人不存在返回 `404 holder_not_found` |
+| `page` | query | 页码，从 1 开始（默认 1；<1 返回 422） |
+| `page_size` | query | 每页条数，默认 50，范围 1–500（越界 422） |
+
+响应要点：
+
+- `records[]`：按"权利人 → 原始编号 → 性质（removed 先于 added）"稳定排序，字段含
+  `root_import_id`（更正链原始编号）、`tail_import_id`（链尾）、`work_code`、
+  `occurred_at`、`agreement_id`、`tail_amount`、`share_percent`、`amount`；
+- `change_type`：`added`=新增（非负）、`removed`=撤销（负额）、`legacy`=不可追溯旧账差额（无播放字段）；
+- `holder_totals[]`：每位权利人 `attributed_total`（归因合计）、
+  `statement_line_amount`（原单据明细行金额）与 `reconciles`（两者是否相等）；
+- `traceable=false`：存量不可追溯单据，`records` 为空、`reconciles` 恒为 false。
 
 ## 调用示例
 
@@ -171,6 +202,20 @@ curl -sS -X POST http://localhost:8000/statements/issue \
   -d '{"start":"2026-02-01T00:00:00+08:00","end":"2026-03-01T00:00:00+08:00"}'
 ```
 
+出具后，财务按单据核对每笔金额来自哪些播放（归因记录分页查询）：
+
+```bash
+# 初次单 batch_id=1：查看权利人 RS-A 的逐笔归因（第 1 页，每页 20 条）
+curl -sS "http://localhost:8000/statements/1/attributions?holder_code=RS-A&page=1&page_size=20"
+
+# 追补单 batch_id=2：撤销(removed，负数)与新增(added)分列、负额保留；
+# holder_totals 中 attributed_total 恒等于该单原明细行金额（reconciles=true）
+curl -sS "http://localhost:8000/statements/2/attributions" | python3 -m json.tool
+
+# 不存在的单据明确报错
+curl -sS -i "http://localhost:8000/statements/999999/attributions"   # 404 statement_not_found
+```
+
 ## 分摊示例
 
 金额 100，比例 62.5% / 30% / 7.5%：
@@ -191,11 +236,13 @@ python3 -m unittest discover -s tests -v
 ```
 
 端到端集成测试（用 [`pgserver`](https://pypi.org/project/pgserver/) 自动拉起便携 PostgreSQL，
-**无需 Docker / root**，覆盖登记、幂等、重叠、更正链、待处理、初次/追补单、并发出具等全链路）：
+**无需 Docker / root**，覆盖登记、幂等、重叠、更正链、待处理、初次/追补单、并发出具等全链路；
+逐笔归因证据（冻结/撤销负额/分页对账/不可变/存量不可追溯与 legacy 旧账/错误码）另有一套：
 
 ```bash
 pip install pgserver httpx
-PYTHONPATH=. python3 tests/integration_pgserver.py
+PYTHONPATH=. python3 tests/integration_pgserver.py       # 原有全链路
+PYTHONPATH=. python3 tests/integration_attribution.py    # 逐笔归因证据
 ```
 
 ## 目录结构
@@ -207,12 +254,12 @@ app/
   db.py                   # 连接池与幂等建表脚本（全部约束在此）
   allocation.py           # 逐笔按比例分摊（最大余数法 + 编号次序）
   schemas.py              # Pydantic 模型与输入校验
-  statements_service.py   # 期间匹配、重算、初次/追补出具、并发互斥
+  statements_service.py   # 期间匹配、重算、初次/追补出具、并发互斥、逐笔归因冻结与分页对账
   routers/
     catalog.py            # 作品 / 权利人 / 协议（含协议区间互斥）
     plays.py              # 播放导入、幂等、更正链
-    statements.py         # 单据出具、试算、查询
+    statements.py         # 单据出具、试算、查询、逐笔归因分页查询
 examples/demo.sh          # 端到端 curl 示例
-tests/                    # 单元测试
+tests/                    # 单元测试与两套 pgserver 端到端集成测试
 Dockerfile  docker-compose.yml  requirements.txt
 ```

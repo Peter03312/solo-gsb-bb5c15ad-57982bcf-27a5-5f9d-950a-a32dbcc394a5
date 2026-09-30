@@ -121,6 +121,84 @@ CREATE TABLE IF NOT EXISTS statement_lines (
     PRIMARY KEY (batch_id, holder_code)
 );
 CREATE INDEX IF NOT EXISTS statement_lines_holder_idx ON statement_lines(holder_code);
+
+-- 单据逐笔归因证据：出具时冻结，此后不再随播放/协议数据变化。
+-- 按更正链"原始编号"(root_import_id) 归集；change_type 标注证据的性质：
+--   added   = 新增（初次单的全部证据、追补单中出现/重算后的链）
+--   removed = 撤销（跨期更正使旧链尾失效，或协议后补改变逐笔结果时冲销旧证据，金额为负）
+--   legacy  = 无逐笔证据的历史旧账差额（不指向任何播放，绝不用当前播放冒充历史）
+CREATE TABLE IF NOT EXISTS statement_attributions (
+    id              bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    batch_id        bigint NOT NULL REFERENCES statement_batches(id) ON DELETE CASCADE,
+    holder_code     text NOT NULL,
+    root_import_id  text,                 -- legacy 行无对应播放，允许为空
+    change_type     text NOT NULL CHECK (change_type IN ('added', 'removed', 'legacy')),
+    -- 出具时冻结的链与分摊快照
+    tail_import_id  text,
+    work_code       text,
+    occurred_at     timestamptz,
+    agreement_id    bigint,
+    tail_amount     bigint,
+    share_percent   numeric(8,4),
+    amount          bigint NOT NULL,      -- 逐笔分摊额（removed 为负）
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    -- 同一单据同一权利人同一链同一性质只能有一条（并发出具不会重复生成证据）。
+    -- legacy 行 root_import_id 为空，用 COALESCE 归入同一命名空间；
+    -- 表达式只能建唯一索引（表级 UNIQUE 约束不支持表达式）。
+    CONSTRAINT statement_attributions_play_fields_chk CHECK (
+        change_type = 'legacy'
+        OR (root_import_id IS NOT NULL AND tail_import_id IS NOT NULL
+            AND work_code IS NOT NULL AND occurred_at IS NOT NULL
+            AND agreement_id IS NOT NULL AND tail_amount IS NOT NULL
+            AND share_percent IS NOT NULL)
+    )
+);
+CREATE UNIQUE INDEX IF NOT EXISTS statement_attributions_uniq
+    ON statement_attributions(
+        batch_id, holder_code, COALESCE(root_import_id, ''), change_type
+    );
+-- 按单据 + 权利人分页/合计的主查询索引（同一次查询内按链、性质稳定排序）
+CREATE INDEX IF NOT EXISTS statement_attributions_batch_holder_idx
+    ON statement_attributions(batch_id, holder_code, root_import_id, change_type, id);
+-- 历史不可变：证据一经插入即禁止修改/删除（级联删除单据除外）
+CREATE OR REPLACE FUNCTION statement_attributions_frozen() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION USING
+        ERRCODE = 'insufficient_privilege',
+        MESSAGE = 'statement attribution evidence is frozen and must not be '
+                  || TG_OP || 'd';
+END;
+$$;
+DROP TRIGGER IF EXISTS statement_attributions_frozen_trg ON statement_attributions;
+CREATE TRIGGER statement_attributions_frozen_trg
+    BEFORE UPDATE OR DELETE ON statement_attributions
+    FOR EACH ROW EXECUTE FUNCTION statement_attributions_frozen();
+
+-- 单据的可追溯性标记：traceable（本轮起出具、带逐笔证据）；
+-- legacy_untraceable（升级前已存在、只有汇总明细行、无法逐笔追溯的存量单据）
+ALTER TABLE statement_batches
+    ADD COLUMN IF NOT EXISTS evidence_status text NOT NULL DEFAULT 'traceable';
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'statement_batches_evidence_chk'
+    ) THEN
+        ALTER TABLE statement_batches
+            ADD CONSTRAINT statement_batches_evidence_chk
+            CHECK (evidence_status IN ('traceable', 'legacy_untraceable'));
+    END IF;
+END $$;
+-- 幂等迁移：把"已有非零明细行但无任何逐笔证据"的存量单据标记为不可追溯；
+-- 空单（仅有待处理播放）不算旧账，仍可追溯。
+UPDATE statement_batches b
+SET evidence_status = 'legacy_untraceable'
+WHERE evidence_status = 'traceable'
+  AND EXISTS (
+      SELECT 1 FROM statement_lines l
+      WHERE l.batch_id = b.id AND l.amount <> 0
+  )
+  AND NOT EXISTS (SELECT 1 FROM statement_attributions a WHERE a.batch_id = b.id);
 """
 
 
