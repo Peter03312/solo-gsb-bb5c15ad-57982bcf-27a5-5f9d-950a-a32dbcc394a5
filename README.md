@@ -15,6 +15,16 @@ Python + FastAPI + PostgreSQL 实现的播放版税结算服务，支持：
   - 已出具单据 **不可覆盖**；
   - 后补协议或播放更正后，再出具按 **新应付额 − 此前单据累计额** 出具 **追补单**，差额 **可正可负**；
   - 应付无变化不产生新单据；同一期间并发出具经咨询锁串行化，**不会产生重复单据**。
+- **逐笔归因证据（本轮新增）**：每次出具时按更正链 **原始编号** 归集并 **冻结** 参与核算的
+  链尾编号、作品、发生时间、匹配协议与逐笔分摊，供财务核对"每位权利人的钱来自哪些播放"：
+  - 追补单逐笔标注 **新增（added）/ 撤销（revoked）**，跨期更正形成"旧链尾撤销（负）+
+    新链尾新增（正）"两个可辨组，协议后补使原待处理播放转为新增；**负额照存不丢失**；
+  - 归因合计与该单据 **原有明细行严格一致**；历史证据为快照，**不随日后数据变化**；
+    待处理播放不计入应付，也不产生归因；
+  - 应付无变化不生成新单据，也 **不生成新证据**；并发出具不会重复生成证据；
+  - 功能上线前 **无逐笔证据的存量单据标记为不可追溯（traceable=false）**；其后首张追补单
+    以 `legacy_anchored` 模式把当前播放全量归因、并把 **无法归因的旧账差额单列**
+    （`legacy_baseline`，旧账取负），**不以当前播放冒充历史**；锚定一次后回归普通逐笔差额。
 
 ## 一键启动
 
@@ -105,11 +115,35 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| POST | `/statements/issue` | 按期间出具；首次初次单，其后差额追补单（无变化不出新单） |
+| POST | `/statements/issue` | 按期间出具；首次初次单，其后差额追补单（无变化不出新单），同时冻结逐笔归因证据 |
 | GET | `/statements/preview?start=&end=` | 不出具，试算当前应付、待处理、潜在差额 |
-| GET | `/statements?start=&end=` | 列出该期间全部单据及明细 |
+| GET | `/statements?start=&end=` | 列出该期间全部单据及明细（含 traceable/attribution_mode 标记） |
+| GET | `/statements/{batch_id}/attribution` | **按单据分页查询逐笔归因记录与权利人合计** |
 
 期间同样是半开区间 `[start, end)`，与协议区间语义一致。
+
+#### 逐笔归因查询 `GET /statements/{batch_id}/attribution`
+
+查询参数：
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `holder_code` | 无 | 只看某一权利人（可选；不存在的权利人返回空结果，不报错） |
+| `page` | `1` | 页码，从 1 开始；`<1` 返回 422 |
+| `page_size` | `50` | 每页归集组数，范围 `1–200`；越界返回 422 |
+
+返回要点：
+
+- `items[]`：按 **更正链原始编号 `chain_root_id` + 出具时链尾 `tail_import_id`** 归集的组。
+  同一链在追补单中若发生更正，会出现"旧链尾撤销组（金额为负）"与"新链尾新增组"两个可辨组；
+  每组含冻结的作品 `work_code`、发生时间 `occurred_at`、匹配协议 `agreement_id`、
+  组合计 `group_amount` 及逐权利人 `entries[]`（`amount` + `change_type`）。
+- `holder_totals[]`：按权利人合计的金额与证据条数；**无 `holder_code` 过滤时与该单据
+  `statement_lines` 明细行逐行一致**（服务端会做一致性自检，不一致报 500）。
+- `total_groups` / `total_entries` / `page` / `page_size`：分页信息。
+- 存量旧单返回 `traceable=false`、`items=[]`、`note` 注明 **not traceable**，
+  `holder_totals` 仍给出原有明细行金额。
+- 不存在的单据 `404 statement_not_found`；`batch_id` 非整数 `422`。
 
 ## 调用示例
 
@@ -169,6 +203,9 @@ curl -sS -X POST http://localhost:8000/plays/import \
 curl -sS -X POST http://localhost:8000/statements/issue \
   -H 'Content-Type: application/json' \
   -d '{"start":"2026-02-01T00:00:00+08:00","end":"2026-03-01T00:00:00+08:00"}'
+
+# 7. 查这张单据的逐笔归因（金额来自哪些播放；分页参数 page/page_size，可选 holder_code）
+curl -sS "http://localhost:8000/statements/1/attribution?page=1&page_size=50"
 ```
 
 ## 分摊示例
@@ -198,6 +235,14 @@ pip install pgserver httpx
 PYTHONPATH=. python3 tests/integration_pgserver.py
 ```
 
+逐笔归因证据的专项集成测试（按原始编号归集、跨期更正的撤销/新增与负额、合计与明细一致性、
+分页与非法参数/不存在单据报错、历史快照不变、存量旧单不可追溯与旧账基线单列、
+并发出具不重复证据）：
+
+```bash
+PYTHONPATH=. python3 tests/integration_attribution.py
+```
+
 ## 目录结构
 
 ```
@@ -207,12 +252,12 @@ app/
   db.py                   # 连接池与幂等建表脚本（全部约束在此）
   allocation.py           # 逐笔按比例分摊（最大余数法 + 编号次序）
   schemas.py              # Pydantic 模型与输入校验
-  statements_service.py   # 期间匹配、重算、初次/追补出具、并发互斥
+  statements_service.py   # 期间匹配、重算、初次/追补出具、逐笔归因冻结与分页查询、并发互斥
   routers/
     catalog.py            # 作品 / 权利人 / 协议（含协议区间互斥）
     plays.py              # 播放导入、幂等、更正链
-    statements.py         # 单据出具、试算、查询
-examples/demo.sh          # 端到端 curl 示例
-tests/                    # 单元测试
+    statements.py         # 单据出具、试算、查询、逐笔归因查询
+examples/demo.sh          # 端到端 curl 示例（含归因查询）
+tests/                    # 单元测试 + 两套 pgserver 端到端集成测试
 Dockerfile  docker-compose.yml  requirements.txt
 ```

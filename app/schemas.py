@@ -185,6 +185,10 @@ class StatementOut(BaseModel):
     period_end: datetime
     issued_at: datetime
     note: str | None = None
+    # 本单据是否持有逐笔归因证据；存量旧单为 false
+    traceable: bool = True
+    # delta：逐笔差额；legacy_anchored：旧单后首张追补（当前全量 + 旧账基线单列）
+    attribution_mode: str = "delta"
     payable: list[StatementLineOut]
     pending: list[PendingItem]
 
@@ -194,5 +198,53 @@ class StatementSummary(BaseModel):
     kind: str
     supersedes_batch_id: int | None
     created_at: datetime
+    traceable: bool = True
+    attribution_mode: str = "delta"
     lines: list[StatementLineOut]
     pending: list[PendingItem]
+
+
+class AttributionEntryOut(BaseModel):
+    holder_code: str
+    # 本单据中该笔播放对该权利人的金额：初次/全量为非负分摊；
+    # 追补差额模式下 revoked 为负，负数照存
+    amount: int
+    # initial | added | revoked | legacy_baseline
+    change_type: str
+
+
+class AttributionGroupOut(BaseModel):
+    # play：按更正链原始编号归集的一笔链尾播放；legacy_baseline：旧账无法归因基线
+    entry_type: str
+    chain_root_id: str | None
+    tail_import_id: str | None
+    work_code: str | None
+    occurred_at: datetime | None
+    agreement_id: int | None
+    group_amount: int
+    entries: list[AttributionEntryOut]
+
+
+class AttributionHolderTotal(BaseModel):
+    holder_code: str
+    # 与该单据 statement_lines 明细行金额严格一致
+    amount: int
+    entry_count: int
+
+
+class AttributionPage(BaseModel):
+    batch_id: int
+    kind: str
+    supersedes_batch_id: int | None
+    period_start: datetime
+    period_end: datetime
+    issued_at: datetime
+    traceable: bool
+    attribution_mode: str
+    page: int
+    page_size: int
+    total_groups: int
+    total_entries: int
+    items: list[AttributionGroupOut]
+    holder_totals: list[AttributionHolderTotal]
+    note: str | None = None

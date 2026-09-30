@@ -94,8 +94,19 @@ CREATE TABLE IF NOT EXISTS statement_batches (
     kind                 text NOT NULL CHECK (kind IN ('initial', 'supplement')),
     supersedes_batch_id  bigint REFERENCES statement_batches(id),
     created_at           timestamptz NOT NULL DEFAULT now(),
+    -- 本单据是否持有逐笔归因证据：功能上线前已存在的存量单据为 false（不可追溯）
+    traceable            boolean NOT NULL DEFAULT true,
+    -- delta：逐笔差额（新增 added / 撤销 revoked）；
+    -- legacy_anchored：旧单之后首张追补单，当前播放全量 + 旧账无法归因基线单列
+    attribution_mode     text NOT NULL DEFAULT 'delta'
+        CHECK (attribution_mode IN ('delta', 'legacy_anchored')),
     CONSTRAINT statement_batches_period_chk CHECK (period_end > period_start)
 );
+-- 幂等升级：为老库补上新增列（CREATE TABLE IF NOT EXISTS 不会改动已存在的表）
+ALTER TABLE statement_batches ADD COLUMN IF NOT EXISTS traceable boolean NOT NULL DEFAULT true;
+ALTER TABLE statement_batches ADD COLUMN IF NOT EXISTS attribution_mode text NOT NULL DEFAULT 'delta';
+-- 已存在的存量单据无逐笔证据，一律标记为不可追溯
+UPDATE statement_batches SET traceable = false WHERE traceable IS DISTINCT FROM false;
 -- 同一期间只能有一张初次单（追补单数量不限）
 CREATE UNIQUE INDEX IF NOT EXISTS statement_batches_initial_uniq
     ON statement_batches(period_start, period_end)
@@ -121,6 +132,41 @@ CREATE TABLE IF NOT EXISTS statement_lines (
     PRIMARY KEY (batch_id, holder_code)
 );
 CREATE INDEX IF NOT EXISTS statement_lines_holder_idx ON statement_lines(holder_code);
+
+-- 逐笔归因证据：每次出具时冻结，历史不随日后数据变化
+-- 按更正链"原始编号"(chain_root_id) 归集；一条链对应一笔参与核算的链尾播放。
+-- amount 为该笔播放对该权利人在本单据中的分摊金额：
+--   initial / legacy_anchored 模式：当前逐笔全量（非负）；
+--   delta 模式：相对上次出具的逐笔差额，撤销为负、新增为正，负数照存不丢失。
+-- entry_type = 'legacy_baseline' 表示旧账无法归因的基线差额（不冒充历史播放）。
+CREATE TABLE IF NOT EXISTS statement_attribution_entries (
+    id             bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    batch_id       bigint NOT NULL REFERENCES statement_batches(id) ON DELETE CASCADE,
+    holder_code    text NOT NULL,
+    chain_root_id  text,                          -- 原始编号；旧账基线为 NULL
+    tail_import_id text,                          -- 出具时冻结的链尾编号
+    work_code      text,
+    occurred_at    timestamptz,
+    agreement_id   bigint,
+    entry_type     text NOT NULL DEFAULT 'play'
+        CHECK (entry_type IN ('play', 'legacy_baseline')),
+    change_type    text NOT NULL
+        CHECK (change_type IN ('initial', 'added', 'revoked', 'legacy_baseline')),
+    amount         bigint NOT NULL
+);
+-- 播放证据同单据同链尾同权利人唯一，杜绝并发出具重复生成证据
+-- （同一更正链的旧 tail 撤销与新 tail 新增可同批出现，故须含 tail_import_id）
+CREATE UNIQUE INDEX IF NOT EXISTS sae_play_uniq
+    ON statement_attribution_entries(batch_id, chain_root_id, tail_import_id, holder_code)
+    WHERE entry_type = 'play';
+-- 旧账无法归因基线：每单据每权利人至多一行
+CREATE UNIQUE INDEX IF NOT EXISTS sae_legacy_uniq
+    ON statement_attribution_entries(batch_id, holder_code)
+    WHERE entry_type = 'legacy_baseline';
+CREATE INDEX IF NOT EXISTS sae_batch_holder_idx
+    ON statement_attribution_entries(batch_id, holder_code);
+CREATE INDEX IF NOT EXISTS sae_root_idx
+    ON statement_attribution_entries(chain_root_id);
 """
 
 

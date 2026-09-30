@@ -97,7 +97,20 @@ $C -X POST "$BASE/statements/issue" -H 'Content-Type: application/json' \
 say "17) 列出该期间全部单据（1 张初次 + 1 张追补）"
 $C "$BASE/statements?start=2026-02-01T00:00:00%2B08:00&end=2026-03-01T00:00:00%2B08:00" | python3 -m json.tool; echo
 
-say "18) 待处理清单：导入另一作品的播放（无协议）并对 3 月出具"
+say "18) 逐笔归因：查追补单每笔金额来自哪条播放（按更正链原始编号归集）"
+# 取最近一张单据 id
+BATCH_ID=$($C "$BASE/statements?start=2026-02-01T00:00:00%2B08:00&end=2026-03-01T00:00:00%2B08:00" | python3 -c 'import sys,json;print(json.load(sys.stdin)[-1]["batch_id"])')
+echo "batch_id=$BATCH_ID"
+$C "$BASE/statements/$BATCH_ID/attribution?page=1&page_size=20" | python3 -m json.tool; echo
+
+say "19) 归因只看权利人 RS-A（holder_totals 与该单据明细行一致）"
+$C "$BASE/statements/$BATCH_ID/attribution?holder_code=RS-A" | python3 -m json.tool; echo
+
+say "20) 非法分页 => 422；不存在单据 => 404"
+$C "$BASE/statements/$BATCH_ID/attribution?page=0"; echo
+$C "$BASE/statements/999999/attribution"; echo
+
+say "21) 待处理清单：导入另一作品的播放（无协议）并对 3 月出具"
 $C -X POST "$BASE/works" -H 'Content-Type: application/json' -d '{"code":"W-LIVE-002","title":"安可集"}'; echo
 $C -X POST "$BASE/plays/import" -H 'Content-Type: application/json' \
   -d '{"import_id":"PLAY-2001","work_code":"W-LIVE-002","occurred_at":"2026-03-05T21:00:00+08:00","amount":500}'; echo
